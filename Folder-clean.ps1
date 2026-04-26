@@ -1,36 +1,107 @@
 param(
-    [string]$Root = (Get-Location).Path
+    [string]$Root = (Get-Location).Path,
+    [string]$FfprobePath = ""
 )
 
 $videoExts = @('.mkv', '.mp4', '.avi', '.mov', '.wmv', '.m4v')
-$subExts   = @('.srt', '.ass', '.ssa', '.sub')
+$subExts   = @('.srt')
 $parent    = (Resolve-Path $Root).Path
 
-Write-Host "=== Starting Flatten Script ===" -ForegroundColor Cyan
+Write-Host "=== Starting Folder Cleanup ===" -ForegroundColor Cyan
 Write-Host "Working folder: $parent"
 Write-Host ""
 
+function Find-Ffprobe {
+    param([string]$PreferredPath)
+
+    if ($PreferredPath -and (Test-Path -LiteralPath $PreferredPath)) {
+        return $PreferredPath
+    }
+
+    $cmd = Get-Command ffprobe -ErrorAction SilentlyContinue
+    if ($cmd) {
+        return $cmd.Source
+    }
+
+    return $null
+}
+
+$ffprobe = Find-Ffprobe -PreferredPath $FfprobePath
+if ($ffprobe) {
+    Write-Host "ffprobe found: $ffprobe" -ForegroundColor Green
+} else {
+    Write-Host "ffprobe not found. Resolution tag will be omitted." -ForegroundColor Yellow
+}
+Write-Host ""
+
+function Get-ResolutionTag {
+    param(
+        [string]$VideoPath,
+        [string]$FfprobeExe
+    )
+
+    if (-not $FfprobeExe) { return $null }
+
+    try {
+        $dims = & $FfprobeExe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "$VideoPath" 2>$null
+        $dims = ($dims | Select-Object -First 1).ToString().Trim()
+
+        if (-not $dims -or $dims -notmatch '^(\d+)x(\d+)$') {
+            return $null
+        }
+
+        $width  = [int]$matches[1]
+        $height = [int]$matches[2]
+
+        if ($width -ge 3800 -or $height -ge 2000) { return '2160p' }
+        elseif ($width -ge 1900 -or $height -ge 1000) { return '1080p' }
+        elseif ($width -ge 1200 -or $height -ge 700) { return '720p' }
+        elseif ($width -ge 700 -or $height -ge 500) { return '480p' }
+        else { return "$height`p" }
+    }
+    catch {
+        return $null
+    }
+}
+
 function Get-CleanBaseName {
-    param([string]$BaseName)
+    param(
+        [string]$BaseName,
+        [string]$ResolutionTag
+    )
 
     $name = $BaseName
 
-    # Remove leading www. site prefix like "www.5MovieRulz.report - "
-    $name = $name -replace '^www\.[^\s]+\s*-\s*', ''
+    if ($name -match '^(.*?)\s*\((\d{4})\)') {
+        $title = $matches[1].Trim()
+        $year  = $matches[2]
+        $name  = "$title ($year)"
+    }
+    else {
+        $name = $name -replace '^www\.[^\s]+\s*-\s*', ''
+        $name = $name -replace '\s*\[[^\]]*\]', ''
+        $name = $name -replace '(?i)\b(720p|1080p|2160p|4k|bluray|webrip|web-dl|hdrip|x264|x265|hevc|avc|aac|dd5\.1|10bit|yts\.\w+|exyusubs)\b', ' '
+        $name = $name -replace '[._-]+', ' '
+        $name = $name -replace '\s+', ' '
+        $name = $name.Trim()
 
-    # Keep only "Title (Year)" and strip everything after
-    $name = $name -replace '^(.+?\(\d{4}\)).*$', '$1'
+        if ($name -match '^(.*?)(\d{4})\b') {
+            $title = $matches[1].Trim()
+            $year  = $matches[2]
+            $name  = "$title ($year)"
+        }
+    }
 
-    # Remove bracketed tags like [YTS.LT] [BluRay] [x264] etc.
-    $name = $name -replace '\s*\[[^\]]*\]', ''
-
-    # Remove dot-separated technical tags like 720p, BluRay, x264, WEBRip, HEVC etc.
-    $name = $name -replace '\s*(720p|1080p|2160p|4K|BluRay|WEBRip|WEB-DL|HDRip|x264|x265|HEVC|AVC|AAC|DD5\.1|YTS\.\w+)(\s|$)', ' '
-
-    # Clean trailing/leading junk
     $name = $name.Trim(' ', '.', '-', '_')
 
-    if ([string]::IsNullOrWhiteSpace($name)) { $name = $BaseName.Trim() }
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        $name = $BaseName.Trim()
+    }
+
+    if ($ResolutionTag) {
+        $name = "$name [$ResolutionTag]"
+    }
+
     return $name
 }
 
@@ -38,49 +109,50 @@ function Get-UniqueTargetPath {
     param(
         [string]$Folder,
         [string]$BaseName,
-        [string]$Extension
+        [string]$Extension,
+        [string]$CurrentFullName = ""
     )
 
     $candidate = Join-Path $Folder ($BaseName + $Extension)
     $i = 1
-    while (Test-Path -LiteralPath $candidate) {
+    while ((Test-Path -LiteralPath $candidate) -and ((Resolve-Path -LiteralPath $candidate).Path -ne $CurrentFullName)) {
         $candidate = Join-Path $Folder ("{0} ({1}){2}" -f $BaseName, $i, $Extension)
         $i++
     }
     return $candidate
 }
 
-# --- Step 1: Move and rename video + matching srt files into parent folder ---
-
-Write-Host "--- Step 1: Moving video and subtitle files ---" -ForegroundColor Yellow
+Write-Host "--- Step 1: Moving video and matching subtitle files from subfolders ---" -ForegroundColor Yellow
 
 $videos = Get-ChildItem -Path $parent -File -Recurse | Where-Object {
     $_.DirectoryName -ne $parent -and $videoExts -contains $_.Extension.ToLower()
 } | Sort-Object FullName
 
-if ($videos.Count -eq 0) {
+if (-not $videos) {
     Write-Host "  No video files found in subfolders." -ForegroundColor Gray
-} else {
+}
+else {
     foreach ($video in $videos) {
-        $cleanBase   = Get-CleanBaseName -BaseName $video.BaseName
-        $videoTarget = Get-UniqueTargetPath -Folder $parent -BaseName $cleanBase -Extension $video.Extension.ToLower()
-
         $sourceDir         = $video.DirectoryName
         $originalVideoBase = $video.BaseName
+        $resolutionTag     = Get-ResolutionTag -VideoPath $video.FullName -FfprobeExe $ffprobe
+        $cleanBase         = Get-CleanBaseName -BaseName $video.BaseName -ResolutionTag $resolutionTag
+        $videoTarget       = Get-UniqueTargetPath -Folder $parent -BaseName $cleanBase -Extension $video.Extension.ToLower() -CurrentFullName $video.FullName
         $finalVideoBase    = [System.IO.Path]::GetFileNameWithoutExtension($videoTarget)
 
         Write-Host "  [VIDEO] Moving:" -ForegroundColor Green
         Write-Host "    FROM: $($video.FullName)"
         Write-Host "    TO:   $videoTarget"
+        if ($resolutionTag) {
+            Write-Host "    META: resolution=$resolutionTag"
+        }
 
         Move-Item -LiteralPath $video.FullName -Destination $videoTarget -ErrorAction Stop
 
-        # Move ONLY the subtitle file whose BaseName exactly matches the video BaseName
         Get-ChildItem -Path $sourceDir -File | Where-Object {
-            $subExts -contains $_.Extension.ToLower() -and
-            $_.BaseName -eq $originalVideoBase
+            $subExts -contains $_.Extension.ToLower() -and $_.BaseName -eq $originalVideoBase
         } | ForEach-Object {
-            $subTarget = Get-UniqueTargetPath -Folder $parent -BaseName $finalVideoBase -Extension $_.Extension.ToLower()
+            $subTarget = Get-UniqueTargetPath -Folder $parent -BaseName $finalVideoBase -Extension $_.Extension.ToLower() -CurrentFullName $_.FullName
             Write-Host "  [SUB]   Moving:" -ForegroundColor Cyan
             Write-Host "    FROM: $($_.FullName)"
             Write-Host "    TO:   $subTarget"
@@ -90,17 +162,15 @@ if ($videos.Count -eq 0) {
 }
 
 Write-Host ""
-
-# --- Step 2: Clean www. prefix from files already sitting in the parent ---
-
-Write-Host "--- Step 2: Renaming leftover www. prefixed files in parent ---" -ForegroundColor Yellow
+Write-Host "--- Step 2: Renaming video files already in parent ---" -ForegroundColor Yellow
 
 Get-ChildItem -Path $parent -File | Where-Object {
-    ($videoExts + $subExts) -contains $_.Extension.ToLower() -and
-    $_.Name -match '^www\.'
+    $videoExts -contains $_.Extension.ToLower()
 } | ForEach-Object {
-    $cleanBase = Get-CleanBaseName -BaseName $_.BaseName
-    $newTarget = Get-UniqueTargetPath -Folder $parent -BaseName $cleanBase -Extension $_.Extension.ToLower()
+    $resolutionTag = Get-ResolutionTag -VideoPath $_.FullName -FfprobeExe $ffprobe
+    $cleanBase = Get-CleanBaseName -BaseName $_.BaseName -ResolutionTag $resolutionTag
+    $newTarget = Get-UniqueTargetPath -Folder $parent -BaseName $cleanBase -Extension $_.Extension.ToLower() -CurrentFullName $_.FullName
+
     if ($_.FullName -ne $newTarget) {
         Write-Host "  [RENAME] $($_.Name) => $(Split-Path $newTarget -Leaf)" -ForegroundColor Green
         Rename-Item -LiteralPath $_.FullName -NewName (Split-Path $newTarget -Leaf) -ErrorAction Stop
@@ -108,44 +178,46 @@ Get-ChildItem -Path $parent -File | Where-Object {
 }
 
 Write-Host ""
+Write-Host "--- Step 3: Renaming subtitle files already in parent ---" -ForegroundColor Yellow
 
-# --- Step 3: Delete all non-video, non-subtitle files in subfolders (images, nfo, txt, jpg etc.) ---
-
-Write-Host "--- Step 3: Deleting leftover junk files in subfolders ---" -ForegroundColor Yellow
-
-Get-ChildItem -Path $parent -File -Recurse | Where-Object {
-    $_.DirectoryName -ne $parent -and
-    ($videoExts + $subExts) -notcontains $_.Extension.ToLower()
-} | ForEach-Object {
-    Write-Host "  [DELETE] $($_.FullName)" -ForegroundColor Red
-    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
-}
-
-Write-Host ""
-
-# --- Step 4: Delete any leftover subtitle files in subfolders ---
-
-Write-Host "--- Step 4: Deleting leftover subtitle files in subfolders ---" -ForegroundColor Yellow
-
-Get-ChildItem -Path $parent -File -Recurse | Where-Object {
-    $_.DirectoryName -ne $parent -and
+Get-ChildItem -Path $parent -File | Where-Object {
     $subExts -contains $_.Extension.ToLower()
 } | ForEach-Object {
+    $cleanBase = Get-CleanBaseName -BaseName $_.BaseName -ResolutionTag $null
+    $newTarget = Get-UniqueTargetPath -Folder $parent -BaseName $cleanBase -Extension $_.Extension.ToLower() -CurrentFullName $_.FullName
+
+    if ($_.FullName -ne $newTarget) {
+        Write-Host "  [RENAME] $($_.Name) => $(Split-Path $newTarget -Leaf)" -ForegroundColor Green
+        Rename-Item -LiteralPath $_.FullName -NewName (Split-Path $newTarget -Leaf) -ErrorAction Stop
+    }
+}
+
+Write-Host ""
+Write-Host "--- Step 4: Deleting leftover junk files in subfolders ---" -ForegroundColor Yellow
+
+Get-ChildItem -Path $parent -File -Recurse | Where-Object {
+    $_.DirectoryName -ne $parent -and ($videoExts + $subExts) -notcontains $_.Extension.ToLower()
+} | ForEach-Object {
     Write-Host "  [DELETE] $($_.FullName)" -ForegroundColor Red
     Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host ""
+Write-Host "--- Step 5: Deleting leftover subtitle files in subfolders ---" -ForegroundColor Yellow
 
-# --- Step 5: Delete now-empty subfolders ---
+Get-ChildItem -Path $parent -File -Recurse | Where-Object {
+    $_.DirectoryName -ne $parent -and $subExts -contains $_.Extension.ToLower()
+} | ForEach-Object {
+    Write-Host "  [DELETE] $($_.FullName)" -ForegroundColor Red
+    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+}
 
-Write-Host "--- Step 5: Deleting empty subfolders ---" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "--- Step 6: Deleting empty subfolders ---" -ForegroundColor Yellow
 
 Get-ChildItem -Path $parent -Directory -Recurse |
     Sort-Object FullName -Descending |
-    Where-Object {
-        -not (Get-ChildItem -LiteralPath $_.FullName -Force)
-    } |
+    Where-Object { -not (Get-ChildItem -LiteralPath $_.FullName -Force) } |
     ForEach-Object {
         Write-Host "  [RMDIR] $($_.FullName)" -ForegroundColor Red
         Remove-Item -LiteralPath $_.FullName -Recurse -Force
